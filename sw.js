@@ -1,7 +1,7 @@
 /* Service worker de Alika: guarda la app en el equipo para que abra sin internet.
    Los DATOS no pasan por aquí: viven en IndexedDB del navegador.
    Al publicar una versión nueva de index.html, sube el número de CACHE. */
-const CACHE = 'alika-v1.1.0';
+const CACHE = 'alika-v1.2.0';
 const ARCHIVOS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './icon-maskable-512.png'];
 
 self.addEventListener('install', e => {
@@ -9,7 +9,8 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));
+  // solo borra cachés viejos de ESTA app (alika-…); nunca los de otras apps del mismo dominio
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k.startsWith('alika-') && k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));
 });
 
 /* Red primero para la página (así toma las actualizaciones cuando hay internet),
