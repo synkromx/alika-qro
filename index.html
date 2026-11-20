@@ -179,7 +179,7 @@ table.t tr.click:hover{background:#faf6ef}
    ALIKA · Inventario y Ventas — app de un solo archivo (sin dependencias)
    Datos en IndexedDB del navegador. Respaldo portátil en .json
    ========================================================================= */
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.2.1';
 const VERSION_ESQUEMA = 3;   // v2: varias sedes · v3: recetas de juegos y venta por partes (IndexedDB sigue en versión 2)
 const DB_NAME = 'alika_inventario';
 const STORES = ['config','productos','variantes','movimientos','eventos','gastos','cortes','precios_ref'];
@@ -607,6 +607,36 @@ async function deshacerMovs(movIds, creadosProd = [], creadosVar = []){
   const ps = creadosProd.filter(id => !conVar.has(id) && !S.movimientos.some(m => m.producto_id === id)); if (ps.length) await del('productos', ps);
 }
 
+/* ---------------- Borrar evento (v1.2.1) ---------------- */
+/* todo lo que cuelga de un evento: sus movimientos (con separaciones completas), gastos y cortes que lo bloquean */
+function contenidoEvento(eid){
+  const sids = new Set(S.movimientos.filter(m => m.evento_id === eid && m.separacion_id).map(m => m.separacion_id));
+  const movs = S.movimientos.filter(m => m.evento_id === eid || sids.has(m.separacion_id));
+  const gastos = S.gastos.filter(g => g.evento_id === eid), ventas = movs.filter(esVentaMov);
+  const cortes = [...new Set(movs.map(m => m.corte_id).filter(Boolean))].map(id => S.cortes.find(c => c.id === id)).filter(Boolean);
+  return {movs, gastos, cortes, nVentas: new Set(ventas.map(m => m.venta_grupo || m.id)).size, venta: sum(ventas, ventaLinea),
+    separaciones: sids.size, montoGastos: sum(gastos, g => g.monto), vacio: !movs.length && gastos.every(g => g.auto_lugar)};
+}
+/* revierte ventas y separaciones, borra gastos y el evento, y anota los ID en "eliminados" para que Fusionar no los reviva */
+async function borrarEvento(eid){
+  const e = IDX.ev.get(eid); if (!e) return null;
+  const c = contenidoEvento(eid);
+  if (c.cortes.length) throw new Error(`Este evento tiene ventas liquidadas en el corte folio ${c.cortes.map(x => x.folio || x.id.slice(0, 8)).join(', ')}. Primero cancela ese corte.`);
+  const candV = [...new Set(c.movs.map(m => m.variante_id))].filter(vid => { const p = prodOfVar(vid); return p && (p.parte_de || p.parcial_de); });
+  const candP = [...new Set(candV.map(vid => IDX.vari.get(vid).producto_id))];
+  const antes = new Set([...S.variantes, ...S.productos].map(r => r.id));
+  await deshacerMovs(c.movs.map(m => m.id), candP, candV);
+  if (c.gastos.length) await del('gastos', c.gastos.map(g => g.id));
+  await del('eventos', eid);
+  const quedan = new Set([...S.variantes, ...S.productos].map(r => r.id));
+  const ids = [eid, ...c.movs.map(m => m.id), ...c.gastos.map(g => g.id), ...[...antes].filter(id => !quedan.has(id))];
+  const patch = {eliminados:[...new Set([...(S.config.eliminados || []), ...ids])]};
+  const activo = (S.config.eventos_activos || {})[e.sede_codigo] === eid;
+  if (activo) patch.eventos_activos = {...S.config.eventos_activos, [e.sede_codigo]:null};
+  await saveConfig(patch);
+  return {activo, borrados:ids.length};
+}
+
 /* ---------------- Migración de esquema v1 → v2 ---------------- */
 /* v1 = una sede por equipo. v2 = varias sedes. Todo lo de v1 queda en QRO (salvo registros que ya digan MID). */
 function migrarSnapshot(o){
@@ -975,11 +1005,13 @@ async function cargarRespaldo(o, modo){
     return {modo, total: sum(LIST_STORES, s => (o.data[s] || []).length), migrado: !!o.migrado_de};
   }
   // fusionar: une por UUID; si existe en ambos, gana el más reciente
-  let nuevos = 0, actualizados = 0, iguales = 0;
+  let nuevos = 0, actualizados = 0, iguales = 0, omitidos = 0;
+  const elim = new Set([...(S.config.eliminados || []), ...((o.config || {}).eliminados || [])]);   // borrados en cualquiera de los dos equipos: no reviven
   const map = {};
   for (const s of LIST_STORES){
     const local = new Map(S[s].map(r => [r.id, r])); map[s] = [];
     for (const r of o.data[s] || []){
+      if (elim.has(r.id)){ omitidos++; continue; }
       const l = local.get(r.id);
       if (!l){ map[s].push(r); nuevos++; }
       else if ((r.actualizado || '') > (l.actualizado || '')){
@@ -990,12 +1022,13 @@ async function cargarRespaldo(o, modo){
   }
   const stores = LIST_STORES.filter(s => map[s].length);
   if (stores.length) await tx(stores,'readwrite', t => { for (const s of stores){ const os = t.objectStore(s); for (const r of map[s]) os.put(r); } });
+  if (elim.size) await saveConfig({eliminados:[...elim]});
   if (o.config){ const patch = {}; if (o.config.personas) patch.personas = [...new Set([...S.config.personas, ...o.config.personas])];
     const ss = sedes().map(x => ({...x})); for (const x of o.config.sedes || []) if (!ss.some(y => y.codigo === x.codigo)) ss.push({...x}); patch.sedes = ss;
     await saveConfig(patch); }
   await loadAll();
   await aplicarRecetasPrecargadas();
-  return {modo, nuevos, actualizados, iguales, migrado: !!o.migrado_de};
+  return {modo, nuevos, actualizados, iguales, omitidos, migrado: !!o.migrado_de};
 }
 function tablasCSV(){
   const P = id => IDX.prod.get(id) || {}; const sc = sedesCodigos();
@@ -1927,7 +1960,8 @@ SCREENS.eventos = () => {
       <div class="row">${e.estado !== 'Cerrado' && e.id !== actDe(e) ? `<button class="btn sm pri" data-a="activarEvento" data-e="${e.id}">▶ Vender aquí</button>` : ''}
         <button class="btn sm ghost" data-a="editarEvento" data-e="${e.id}">✏️ Editar</button>
         ${e.estado !== 'Cerrado' ? `<button class="btn sm ghost" data-a="cerrarEvento" data-e="${e.id}">🔒 Cerrar</button>` : `<button class="btn sm ghost" data-a="reabrirEvento" data-e="${e.id}">🔓 Reabrir</button>`}
-        <button class="btn sm ghost" data-a="verResultados" data-e="${e.id}">📊 Resultados</button></div></div>`; }).join('')}</div>`
+        <button class="btn sm ghost" data-a="verResultados" data-e="${e.id}">📊 Resultados</button>
+        <button class="btn sm ghost" data-a="borrarEvento" data-e="${e.id}">🗑️ Borrar</button></div></div>`; }).join('')}</div>`
     : '<div class="card empty">Todavía no hay eventos. Crea el primero (feria, mercadito, venta digital…).</div>'}`;
 };
 A.nuevoEvento = () => { if (requiereSede()) editarEvento(null); };
@@ -1938,6 +1972,29 @@ A.activarEvento = async el => {
   if (vista() !== e.sede_codigo){ await saveConfig({sede_activa:e.sede_codigo}); aplicarSedeVisual(); renderNav(); }
   toast(`Vendiendo en: ${esc(e.nombre)} (${esc(sedeNombre(e.sede_codigo))})`); rerender(); };
 A.verResultados = el => { UI.rf = {ev:el.dataset.e, desde:'', hasta:''}; go('resultados'); };
+A.borrarEvento = el => flujoBorrarEvento(el.dataset.e);
+async function flujoBorrarEvento(eid){
+  const e = IDX.ev.get(eid); if (!e) return; const c = contenidoEvento(eid);
+  if (c.cortes.length){ alertDlg('No se puede borrar', `Este evento tiene ventas liquidadas en el corte folio <b>${c.cortes.map(x => esc(x.folio || x.id.slice(0, 8))).join(', ')}</b>. Primero cancela ese corte.`); return; }
+  if (c.vacio){ if (!await confirmDlg({titulo:'¿Borrar evento?', msg:`"${esc(e.nombre)}" no tiene ventas ni gastos.`, ok:'Sí, borrar', danger:true})) return; }
+  else {
+    const partes = [c.nVentas ? `${c.nVentas} venta(s) por ${money(c.venta)}` : '', c.gastos.length ? `${c.gastos.length} gasto(s) por ${money(c.montoGastos)}` : '', c.separaciones ? `${c.separaciones} separación(es) de juego` : ''].filter(Boolean);
+    const ok = await new Promise(res => {
+      const m = modal(`${mhead('🗑️ Borrar evento')}<div class="stack"><div><b>${esc(e.nombre)}</b> (${esc(sedeNombre(e.sede_codigo))}) tiene ${partes.join(', ').replace(/, ([^,]*)$/, ' y $1') || c.movs.length + ' movimiento(s)'}.</div>
+        <div class="alert warn">Se revierten las ventas (las piezas regresan a la existencia de su sede y ubicación), se deshacen las separaciones de juegos y se borran sus gastos. Antes se guarda un respaldo automático.</div>
+        <label class="f">Para confirmar escribe <b>BORRAR</b><input type="text" id="bconf" autocomplete="off" autofocus></label>
+        <div class="row" style="justify-content:flex-end"><button class="btn ghost" id="bno">Cancelar</button><button class="btn bad" id="bsi" disabled>Borrar evento y todo lo que tiene</button></div></div>`, {onClose:() => res(false)});
+      $('#bconf', m).oninput = ev => { $('#bsi', m).disabled = ev.target.value.trim().toUpperCase() !== 'BORRAR'; };
+      $('#bno', m).onclick = () => closeModal();
+      $('#bsi', m).onclick = () => { _modals.pop().remove(); res(true); };
+    });
+    if (!ok) return;
+    try { const txt = JSON.stringify(snapshot()); await tx(['meta'],'readwrite', t => t.objectStore('meta').put({id:'antes_borrar_evento', fecha:nowISO(), json:txt}));
+      download('ALIKA_ANTES_DE_BORRAR_EVENTO_' + nombreRespaldo().replace('ALIKA_', ''), txt, 'application/json'); } catch(err){}
+  }
+  try { const r = await borrarEvento(eid); closeAll(); toast(r.activo ? '🗑️ Evento borrado. Era el evento de venta: elige otro en Vender.' : '🗑️ Evento borrado'); render(); }
+  catch (err){ alertDlg('No se pudo borrar', esc(err.message)); }
+}
 A.reabrirEvento = async el => { const e = IDX.ev.get(el.dataset.e); e.estado = 'Activo'; await put('eventos', e); rerender(); };
 A.cerrarEvento = async el => {
   const e = IDX.ev.get(el.dataset.e);
@@ -1970,14 +2027,7 @@ function editarEvento(eid, {rapido = false} = {}){
     if (e.estado !== 'Cerrado' && (rapido || !eventoActivo(e.sede_codigo))) await setEventoActivo(e.sede_codigo, e.id);
     closeModal(); toast('✅ Evento guardado'); rerender();
   };
-  if ($('#edel', m)) $('#edel', m).onclick = async () => {
-    const nm = S.movimientos.filter(x => x.evento_id === eid).length, ng = S.gastos.filter(g => g.evento_id === eid && !g.auto_lugar).length;
-    if (nm || ng){ alertDlg('No se puede borrar', `Este evento tiene ${nm} movimiento(s) y ${ng} gasto(s). Ciérralo en lugar de borrarlo.`); return; }
-    if (!await confirmDlg({titulo:'¿Borrar evento?', msg:esc(e.nombre), ok:'Sí, borrar', danger:true})) return;
-    await del('gastos', S.gastos.filter(g => g.evento_id === eid).map(g => g.id)); await del('eventos', eid);
-    if ((S.config.eventos_activos || {})[e.sede_codigo] === eid) await setEventoActivo(e.sede_codigo, null);
-    closeModal(); rerender();
-  };
+  if ($('#edel', m)) $('#edel', m).onclick = () => flujoBorrarEvento(eid);
 }
 
 /* =========================================================================
@@ -2614,7 +2664,7 @@ C.cargarResp = async el => {
     catch (e){ alertDlg('❌ Error', esc(e.message) + '<br>Tus datos no se modificaron.'); }
   };
   $('#rfus', m).onclick = async () => {
-    try { const r = await cargarRespaldo(o, 'fusionar'); closeAll(); await alertDlg('✅ Respaldos fusionados', `${r.nuevos} registro(s) nuevos · ${r.actualizados} actualizados · ${r.iguales} sin cambio.${r.migrado ? '<br>Venía de la versión anterior: sus registros quedaron en Querétaro (QRO).' : ''}`); render(); }
+    try { const r = await cargarRespaldo(o, 'fusionar'); closeAll(); await alertDlg('✅ Respaldos fusionados', `${r.nuevos} registro(s) nuevos · ${r.actualizados} actualizados · ${r.iguales} sin cambio${r.omitidos ? ` · ${r.omitidos} ya borrado(s) aquí (no se restauran)` : ''}.${r.migrado ? '<br>Venía de la versión anterior: sus registros quedaron en Querétaro (QRO).' : ''}`); render(); }
     catch (e){ alertDlg('❌ Error', esc(e.message)); }
   };
 };
@@ -2718,7 +2768,7 @@ async function init(){
 }
 /* expone funciones para pruebas */
 window.ALIKA = {S, IDX, readXlsx, parseCSV, analizarImport, aplicarImport, leerPrecios, leerCasa, guessHeaderRow, guessMapping, resultados, inventarioTotales, stockOf, calcular, snapshot, cargarRespaldo, validarRespaldo, put, del, clearAll, kardexRows, REP, REP1,
-  migrarSnapshot, migrarLocal, migrarLocalV3, aplicarRecetasPrecargadas, recetaEfectiva, avisoReceta, precioParte, construirSeparacion, deshacerMovs, planImport, totalesPlan, cmpVer, actualizarApp, generarCorte, pagarCorte, cancelarCorte, pendientesCorte, saveConfig, sedesCodigos, vista, loadAll, respaldoPremigracion};
+  migrarSnapshot, migrarLocal, migrarLocalV3, aplicarRecetasPrecargadas, recetaEfectiva, avisoReceta, precioParte, construirSeparacion, deshacerMovs, contenidoEvento, borrarEvento, planImport, totalesPlan, cmpVer, actualizarApp, generarCorte, pagarCorte, cancelarCorte, pendientesCorte, saveConfig, sedesCodigos, vista, loadAll, respaldoPremigracion};
 init();
 </script>
 </body>
