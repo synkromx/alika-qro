@@ -38,6 +38,7 @@ body{border-top:6px solid var(--sede,#1f4e52)}
 .sedesel{display:flex;background:rgba(0,0,0,.18);border-radius:12px;padding:3px;gap:3px;flex-wrap:wrap}
 .sedesel button{border:0;background:transparent;color:#fff;font-weight:700;min-height:44px;padding:6px 14px;border-radius:9px;cursor:pointer;font-size:.95rem}
 .sedesel button.on{background:#fff;color:var(--c)}
+.sedegrp{color:#fff;opacity:.85;font-size:.85rem;font-weight:700;align-self:center;padding:0 2px 0 8px}
 .sedetag{display:inline-block;border-radius:6px;padding:1px 7px;font-size:.78rem;font-weight:800;color:#fff;background:var(--c,#666)}
 .bnav{position:fixed;left:0;right:0;bottom:0;background:#fff;border-top:1px solid var(--line);display:flex;z-index:30;padding-bottom:env(safe-area-inset-bottom)}
 .bnav button{flex:1;border:0;background:none;padding:8px 2px 10px;min-height:64px;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:.8rem;color:var(--muted);cursor:pointer}
@@ -179,14 +180,14 @@ table.t tr.click:hover{background:#faf6ef}
    ALIKA · Inventario y Ventas — app de un solo archivo (sin dependencias)
    Datos en IndexedDB del navegador. Respaldo portátil en .json
    ========================================================================= */
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.2.2';
 const VERSION_ESQUEMA = 3;   // v2: varias sedes · v3: recetas de juegos y venta por partes (IndexedDB sigue en versión 2)
 const DB_NAME = 'alika_inventario';
 const STORES = ['config','productos','variantes','movimientos','eventos','gastos','cortes','precios_ref'];
 const LIST_STORES = STORES.filter(s => s !== 'config');
 const SEDE_STORES = ['movimientos','eventos','gastos','cortes'];   // registros que pertenecen a una sede
 const TODAS = 'TODAS';
-const SEDES_DEFAULT = [{codigo:'QRO', nombre:'Querétaro', color:'#1f4e52'}, {codigo:'MID', nombre:'Mérida', color:'#8a3a62'}];
+const SEDES_DEFAULT = [{codigo:'QRO', nombre:'Querétaro', ciudad:'Querétaro', color:'#1f4e52'}, {codigo:'MID', nombre:'Mérida Local 1', ciudad:'Mérida', color:'#8a3a62'}, {codigo:'MID2', nombre:'Mérida Local 2', ciudad:'Mérida', color:'#c2701e'}];
 
 const CATEGORIAS = ['Aretes','Dijes','Anillos','Pulseras','Juegos','Collares','Otros'];
 const CAT_GASTO = ['Lugar / cuota','Transporte','Empaque y bolsas','Exhibidores y mobiliario','Personal','Comisiones de tarjeta','Publicidad','Comida','Otros'];
@@ -266,12 +267,36 @@ const DEFAULT_CONFIG = {
 };
 /* ---- sedes ---- */
 const vista = () => S.config.sede_activa || 'QRO';
-const esTodas = () => vista() === TODAS;
+/* una vista es una sede (QRO, MID, MID2…), una plaza "CIU:<ciudad>" (consolidado de sus locales) o TODAS. Plaza y TODAS son consolidados: no se captura */
+const esGrupo = v => v === TODAS || String(v).startsWith('CIU:');
+const esTodas = () => esGrupo(vista());
 const sedes = () => (S.config.sedes && S.config.sedes.length) ? S.config.sedes : SEDES_DEFAULT;
-const sedesCodigos = () => { const set = new Set(sedes().map(x => x.codigo)); for (const k of SEDE_STORES) for (const r of S[k]) if (r.sede_codigo && r.sede_codigo !== TODAS) set.add(r.sede_codigo); return [...set]; };
-function sedeInfo(c){ if (c === TODAS) return {codigo:TODAS, nombre:'Todas las sedes', color:'#4a4f55'}; return sedes().find(x => x.codigo === c) || {codigo:c, nombre:c, color:'#666'}; }
+const sedesCodigos = () => [...new Set([...sedes().map(x => x.codigo), ...(IDX.sedesData || [])])];
+function sedeInfo(c){
+  if (c === TODAS) return {codigo:TODAS, nombre:'Todas las sedes', color:'#4a4f55'};
+  if (String(c).startsWith('CIU:')) return {codigo:c, nombre:c.slice(4) + ' — consolidado', ciudad:c.slice(4), color:'#4a4f55'};
+  return sedes().find(x => x.codigo === c) || {codigo:c, nombre:c, color:'#666'};
+}
 const sedeNombre = c => sedeInfo(c).nombre;
-const enSede = (r, sede = vista()) => sede === TODAS || r.sede_codigo === sede;
+const ciudadDe = c => { const x = sedeInfo(c); return x.ciudad || x.nombre; };
+const ciudades = () => [...new Set(sedesCodigos().map(ciudadDe))];
+function sedesDe(v){ if (v === TODAS) return sedesCodigos(); if (String(v).startsWith('CIU:')) return sedesCodigos().filter(c => ciudadDe(c) === v.slice(4)); return [v]; }
+/* columnas de un consolidado: en una plaza, una por local; en Todas, una por plaza */
+const columnasDe = v => v === TODAS ? ciudades().map(ci => ({key:'CIU:' + ci, t:ci, codes:sedesDe('CIU:' + ci)})) : sedesDe(v).map(c => ({key:c, t:c, codes:[c]}));
+const enSede = (r, sede = vista()) => sede === TODAS || (String(sede).startsWith('CIU:') ? ciudadDe(r.sede_codigo) === sede.slice(4) : r.sede_codigo === sede);
+const alcanceTxt = c => c === TODAS ? 'Conjunto' : String(c).startsWith('CIU:') ? c.slice(4) : c;
+/* v1.2.2: cada sede lleva ciudad; MID pasa a "Mérida Local 1" y se agrega MID2. Solo una vez (o al cargar respaldos viejos). */
+async function normalizarSedes(){
+  if (S.config.sedes_ciudad) return false;
+  const pre = {QRO:'Querétaro', MID:'Mérida', MID2:'Mérida'};
+  const ss = sedes().map(x => ({...x, ciudad: x.ciudad || pre[x.codigo] || x.nombre}));
+  const mid = ss.find(x => x.codigo === 'MID');
+  if (mid && norm(mid.nombre) === 'MERIDA') mid.nombre = 'Mérida Local 1';
+  if (mid && !ss.some(x => x.codigo === 'MID2')) ss.splice(ss.indexOf(mid) + 1, 0, {codigo:'MID2', nombre:'Mérida Local 2', ciudad:'Mérida', color:'#c2701e'});
+  if (LIST_STORES.some(k => S[k].length)) await tx(['meta'],'readwrite', t => t.objectStore('meta').put({id:'premigracion_v122', fecha:nowISO(), json:JSON.stringify(snapshot())}));
+  await saveConfig({sedes:ss, sedes_ciudad:true});
+  return true;
+}
 function precioVenta(p, sede = vista()){ const o = p && p.precios_sede && num(p.precios_sede[sede]); return o > 0 ? o : num(p && p.precio_venta); }
 const S = { config:{...DEFAULT_CONFIG} };
 for (const s of LIST_STORES) S[s] = [];
@@ -283,6 +308,7 @@ function reindex(){
   IDX.vari = new Map(S.variantes.map(v => [v.id, v]));
   IDX.ev = new Map(S.eventos.map(e => [e.id, e]));
   IDX.varsByProd = groupBy(S.variantes, v => v.producto_id);
+  IDX.sedesData = new Set(); for (const k of SEDE_STORES) for (const r of S[k]) if (r.sede_codigo && !esGrupo(r.sede_codigo)) IDX.sedesData.add(r.sede_codigo);
   _stock = null;
 }
 async function loadAll(){
@@ -367,9 +393,9 @@ function stockMap(){
 }
 function stockOf(vid, sede = vista()){
   const st = stockMap();
-  if (sede !== TODAS){ const x = st.get(sede + '|' + vid); return x ? {...x} : {total:0, Stand:0, Casa:0}; }
+  if (!esGrupo(sede)){ const x = st.get(sede + '|' + vid); return x ? {...x} : {total:0, Stand:0, Casa:0}; }
   const r = {total:0, Stand:0, Casa:0};
-  for (const c of sedesCodigos()){ const x = st.get(c + '|' + vid); if (x){ r.total += x.total; r.Stand += x.Stand; r.Casa += x.Casa; } }
+  for (const c of sedesDe(sede)){ const x = st.get(c + '|' + vid); if (x){ r.total += x.total; r.Stand += x.Stand; r.Casa += x.Casa; } }
   return r;
 }
 function stockProd(pid, sede = vista()){ return sum(IDX.varsByProd.get(pid) || [], v => stockOf(v.id, sede).total); }
@@ -377,7 +403,7 @@ const prodOfVar = vid => IDX.prod.get(IDX.vari.get(vid)?.producto_id);
 function varLabel(vid){ const v = IDX.vari.get(vid); const p = v && IDX.prod.get(v.producto_id); return p ? `${p.nombre} · ${v.color}` : '(variante borrada)'; }
 
 function inventarioTotales(sede = vista()){
-  if (sede === TODAS){ const t = {piezas:0, valor:0, valorVenta:0}; for (const c of sedesCodigos()){ const x = inventarioTotales(c); t.piezas += x.piezas; t.valor += x.valor; t.valorVenta += x.valorVenta; } return t; }
+  if (esGrupo(sede)){ const t = {piezas:0, valor:0, valorVenta:0}; for (const c of sedesDe(sede)){ const x = inventarioTotales(c); t.piezas += x.piezas; t.valor += x.valor; t.valorVenta += x.valorVenta; } return t; }
   let piezas = 0, valor = 0, valorVenta = 0;
   for (const v of S.variantes){ const p = IDX.prod.get(v.producto_id); if (!p) continue; const q = stockOf(v.id, sede).total; piezas += q; valor += q * num(p.precio_fabricante); valorVenta += q * precioVenta(p, sede); }
   return {piezas, valor, valorVenta};
@@ -416,7 +442,7 @@ function resultados(f = {}){
   return r;
 }
 function eventoDias(e){ if (!e.fecha_inicio) return 1; return Math.max(1, daysBetween(e.fecha_inicio, e.fecha_fin || e.fecha_inicio) + 1); }
-function eventoActivo(sede = vista()){ if (sede === TODAS) return null; const e = IDX.ev.get((S.config.eventos_activos || {})[sede]); return e && e.estado !== 'Cerrado' && e.sede_codigo === sede ? e : null; }
+function eventoActivo(sede = vista()){ if (esGrupo(sede)) return null; const e = IDX.ev.get((S.config.eventos_activos || {})[sede]); return e && e.estado !== 'Cerrado' && e.sede_codigo === sede ? e : null; }
 async function setEventoActivo(sede, id){ await saveConfig({eventos_activos:{...(S.config.eventos_activos || {}), [sede]:id || null}}); }
 
 /* ---------------- Cortes con Alika ---------------- */
@@ -449,6 +475,8 @@ async function cancelarCorte(id){
   if (movs.length) await put('movimientos', movs);
   await del('cortes', id);
 }
+/* un corte se ve en una vista si comparten alguna sede (corte de plaza o conjunto incluido) */
+const corteVisible = (c, v) => { const a = sedesDe(c.sede_codigo); return sedesDe(v).some(x => a.includes(x)); };
 const corteDe = m => m.corte_id ? S.cortes.find(c => c.id === m.corte_id) : null;
 
 /* ---------------- Vender por partes (v1.2) ---------------- */
@@ -889,7 +917,7 @@ function totalesPlan(plan, costos = {}){
 }
 async function aplicarImport(an, opt = {}){
   const sede = opt.sede || vista();
-  if (!sede || sede === TODAS) throw new Error('Elige a qué sede se carga el inventario.');
+  if (!sede || esGrupo(sede)) throw new Error('Elige a qué sede se carga el inventario.');
   if (opt.nuevaSede && !sedes().some(x => x.codigo === sede)) await saveConfig({sedes:[...sedes().map(x => ({...x})), {...opt.nuevaSede}]});
   if (!sedes().some(x => x.codigo === sede)) throw new Error(`La sede ${sede} no existe.`);
   const modo = opt.modo || 'sumar';
@@ -1001,7 +1029,7 @@ async function cargarRespaldo(o, modo){
       t.objectStore('config').put(cfg);
     });
     await loadAll();
-    await aplicarRecetasPrecargadas();
+    await normalizarSedes(); await aplicarRecetasPrecargadas();
     return {modo, total: sum(LIST_STORES, s => (o.data[s] || []).length), migrado: !!o.migrado_de};
   }
   // fusionar: une por UUID; si existe en ambos, gana el más reciente
@@ -1027,7 +1055,7 @@ async function cargarRespaldo(o, modo){
     const ss = sedes().map(x => ({...x})); for (const x of o.config.sedes || []) if (!ss.some(y => y.codigo === x.codigo)) ss.push({...x}); patch.sedes = ss;
     await saveConfig(patch); }
   await loadAll();
-  await aplicarRecetasPrecargadas();
+  await normalizarSedes(); await aplicarRecetasPrecargadas();
   return {modo, nuevos, actualizados, iguales, omitidos, migrado: !!o.migrado_de};
 }
 function tablasCSV(){
@@ -1045,7 +1073,7 @@ function tablasCSV(){
     gastos: [['id','sede','fecha','evento','categoria','monto','descripcion','pagado_por','inversion_inicial'],
       ...S.gastos.map(g => [g.id,g.sede_codigo,fdate(g.fecha),ev(g.evento_id)||'(general)',g.categoria,g.monto,g.descripcion||'',g.pagado_por||'',g.es_inversion_inicial?'sí':'no'])],
     cortes: [['id','sede','fecha_corte','periodo_desde','periodo_hasta','piezas','venta_total','total_a_pagar_fabricante','piezas_devueltas','valor_devuelto','estado','fecha_pago','referencia'],
-      ...S.cortes.map(c => [c.id,c.sede_codigo === TODAS ? 'Conjunto' : c.sede_codigo,fdt(c.fecha_corte),fdate(c.periodo_desde),fdate(c.periodo_hasta),c.piezas,c.venta_total,c.total_a_pagar_fabricante,c.piezas_devueltas,c.valor_devuelto,c.estado,fdate(c.fecha_pago),c.referencia||''])],
+      ...S.cortes.map(c => [c.id,alcanceTxt(c.sede_codigo),fdt(c.fecha_corte),fdate(c.periodo_desde),fdate(c.periodo_hasta),c.piezas,c.venta_total,c.total_a_pagar_fabricante,c.piezas_devueltas,c.valor_devuelto,c.estado,fdate(c.fecha_pago),c.referencia||''])],
   };
 }
 
@@ -1127,17 +1155,20 @@ function renderNav(){
     `<button class="${enMas?'on':''}" data-a="mas"><span class="ic">☰</span>Más</button>`;
 }
 function selectorSede(){
-  const cur = vista();
-  return `<div class="sedesel" role="group" aria-label="Sede">${[...sedes(), sedeInfo(TODAS)].map(x => `<button class="${cur === x.codigo ? 'on' : ''}" style="--c:${esc(x.color)}" data-a="setSede" data-v="${esc(x.codigo)}">${x.codigo === TODAS ? '🌐 Todas' : esc(x.nombre)}</button>`).join('')}</div>`;
+  const cur = vista(); const b = (v, txt, color) => `<button class="${cur === v ? 'on' : ''}" style="--c:${esc(color)}" data-a="setSede" data-v="${esc(v)}">${txt}</button>`;
+  return `<div class="sedesel" role="group" aria-label="Sede">${[...groupBy(sedes(), x => x.ciudad || x.nombre)].map(([ci, xs]) => xs.length === 1 ? b(xs[0].codigo, esc(xs[0].nombre), xs[0].color)
+    : `<span class="sedegrp">${esc(ci)}:</span>${xs.map(x => b(x.codigo, esc(x.nombre.startsWith(ci) ? x.nombre.slice(ci.length).trim() || x.nombre : x.nombre), x.color)).join('')}${b('CIU:' + ci, 'Σ consolidado', '#4a4f55')}`).join('')}${b(TODAS, '🌐 Todas', '#4a4f55')}</div>`;
 }
-const sedeTag = c => { const x = sedeInfo(c); return `<span class="sedetag" style="--c:${esc(x.color)}">${c === TODAS ? 'Conjunto' : esc(x.codigo)}</span>`; };
+/* opciones de sede para reportes: cada sede, cada plaza con varios locales y Todas */
+const opcionesVista = sel => sedes().map(x => opt(x.codigo, x.nombre, sel)).join('') + [...groupBy(sedes(), x => x.ciudad || x.nombre)].filter(([, xs]) => xs.length > 1).map(([ci]) => opt('CIU:' + ci, ci + ' — consolidado', sel)).join('') + opt(TODAS, 'Consolidado (todas)', sel);
+const sedeTag = c => { const x = sedeInfo(c); return `<span class="sedetag" style="--c:${esc(x.color)}">${esc(alcanceTxt(c))}</span>`; };
 function aplicarSedeVisual(){
   const c = sedeInfo(vista()).color; document.documentElement.style.setProperty('--sede', c);
   const mt = document.querySelector('meta[name=theme-color]'); if (mt) mt.setAttribute('content', c);
 }
 function requiereSede(){
   if (!esTodas()) return true;
-  alertDlg('Elige una sede para registrar', 'Con <b>"Todas"</b> seleccionado solo se puede consultar e imprimir reportes. Arriba elige <b>' + sedes().map(x => esc(x.nombre)).join('</b> o <b>') + '</b>.');
+  alertDlg('Elige una sede para registrar', 'Con <b>' + esc(sedeNombre(vista())) + '</b> seleccionado solo se puede consultar e imprimir reportes. Arriba elige <b>' + sedes().map(x => esc(x.nombre)).join('</b> o <b>') + '</b>.');
   return false;
 }
 A.setSede = async el => {
@@ -1145,7 +1176,7 @@ A.setSede = async el => {
   if (UI.cart.length && !await confirmDlg({titulo:'¿Cambiar de sede?', msg:'Hay piezas en la venta en curso. Si cambias de sede, la venta se vacía.', ok:'Sí, cambiar'})) return;
   UI.cart = []; UI.desc.v = ''; UI.ultimaVenta = null; UI.consumo = false; UI.rf.ev = ''; UI.gf.ev = '';
   await saveConfig({sede_activa:v}); aplicarSedeVisual(); closeAll(); render();
-  toast(v === TODAS ? '🌐 Viendo todas las sedes (solo consulta)' : `📍 Ahora registras en ${esc(sedeNombre(v))}`);
+  toast(esGrupo(v) ? `🌐 Viendo ${esc(sedeNombre(v))} (solo consulta)` : `📍 Ahora registras en ${esc(sedeNombre(v))}`);
 };
 function topbar(titulo){
   const ev = eventoActivo(); const si = sedeInfo(vista());
@@ -1153,7 +1184,7 @@ function topbar(titulo){
   const ult = S.config.ultimo_respaldo; const viejo = tieneDatos && (!ult || Date.now() - new Date(ult) > 24*3600000);
   return `<div class="topbar sedebar" style="--sede:${esc(si.color)}"><span class="brand">${titulo}</span><span class="sede">📍 ${esc(si.nombre)}</span>
     ${ev ? `<span class="pill">🎪 ${esc(ev.nombre)}</span>` : ''}<span class="grow"></span>${selectorSede()}</div>
-    ${esTodas() ? `<div class="banner alert info">🌐 Estás viendo <b>todas las sedes</b>: solo consulta y reportes consolidados. Para registrar, elige una sede arriba.</div>` : ''}
+    ${esTodas() ? `<div class="banner alert info">🌐 Estás viendo <b>${esc(sedeNombre(vista()))}</b>: solo consulta y reportes consolidados. Para registrar, elige una sede arriba.</div>` : ''}
     ${viejo ? `<div class="banner alert warn">⚠️ Último respaldo: ${hace(ult)}. Los datos solo viven en este equipo.<span class="grow"></span><button class="btn sm acc" data-a="respaldoRapido">💾 Guardar respaldo</button></div>` : ''}`;
 }
 A.respaldoRapido = async () => { await guardarRespaldo(!!navigator.canShare); toast('✅ Respaldo guardado'); render(); };
@@ -1173,7 +1204,7 @@ function rerender(){ const y = window.scrollY; $('#main').innerHTML = SCREENS[UI
 const opt = (v, t, sel) => `<option value="${esc(v)}" ${String(v) === String(sel) ? 'selected' : ''}>${esc(t)}</option>`;
 function eventosOpts(sel, {todos = 'Todos los eventos', soloAbiertos = false, ninguno = null, sede = vista()} = {}){
   const evs = [...S.eventos].filter(e => enSede(e, sede) && (!soloAbiertos || e.estado !== 'Cerrado')).sort((a,b) => (b.fecha_inicio||'').localeCompare(a.fecha_inicio||''));
-  return (ninguno != null ? opt('', ninguno, sel) : (todos ? opt('', todos, sel) : '')) + evs.map(e => opt(e.id, `${sede === TODAS ? '[' + e.sede_codigo + '] ' : ''}${e.nombre}${e.fecha_inicio ? ' · ' + fdate(e.fecha_inicio) : ''}${e.estado === 'Cerrado' ? ' (cerrado)' : ''}`, sel)).join('');
+  return (ninguno != null ? opt('', ninguno, sel) : (todos ? opt('', todos, sel) : '')) + evs.map(e => opt(e.id, `${esGrupo(sede) ? '[' + e.sede_codigo + '] ' : ''}${e.nombre}${e.fecha_inicio ? ' · ' + fdate(e.fecha_inicio) : ''}${e.estado === 'Cerrado' ? ' (cerrado)' : ''}`, sel)).join('');
 }
 function catsEnUso(){ const set = new Set(S.productos.map(p => p.categoria)); return CATEGORIAS.filter(c => set.has(c)).concat([...set].filter(c => !CATEGORIAS.includes(c))); }
 function catChips(sel, action){ return `<div class="chips">${['Todas', ...catsEnUso()].map(c => `<button class="chip ${sel===c?'on':''}" data-a="${action}" data-v="${esc(c)}">${c === 'Todas' ? 'Todas' : (CAT_ICON[c]||'') + ' ' + esc(c)}</button>`).join('')}</div>`; }
@@ -1194,14 +1225,14 @@ SCREENS.inicio = () => {
   ${esTodas() ? '' : `<button class="btn acc huge" data-a="go" data-s="vender" style="margin-bottom:14px;background:var(--sede);border-color:var(--sede)">🛒 VENDER EN ${esc(sedeNombre(vista()).toUpperCase())}</button>`}
   <div class="grid g4">
     <div class="kpi"><div class="l">Venta de hoy</div><div class="v">${money(rHoy.venta)}</div><div class="s">${int(rHoy.piezas)} piezas · margen ${money(rHoy.margen)}</div></div>
-    <div class="kpi"><div class="l">${ev ? 'Evento: ' + esc(ev.nombre) : esTodas() ? 'Eventos abiertos' : 'Sin evento activo'}</div><div class="v">${rEv ? money(rEv.venta) : esTodas() ? int(S.eventos.filter(e => e.estado !== 'Cerrado').length) : '—'}</div><div class="s">${rEv ? `${int(rEv.piezas)} piezas vendidas` : esTodas() ? 'en todas las sedes' : '<a href="#eventos">Activar un evento</a>'}</div></div>
+    <div class="kpi"><div class="l">${ev ? 'Evento: ' + esc(ev.nombre) : esTodas() ? 'Eventos abiertos' : 'Sin evento activo'}</div><div class="v">${rEv ? money(rEv.venta) : esTodas() ? int(S.eventos.filter(e => e.estado !== 'Cerrado' && enSede(e)).length) : '—'}</div><div class="s">${rEv ? `${int(rEv.piezas)} piezas vendidas` : esTodas() ? esc(sedeNombre(vista())) : '<a href="#eventos">Activar un evento</a>'}</div></div>
     <div class="kpi"><div class="l">Utilidad del evento</div><div class="v ${rEv && rEv.utilidad < 0 ? 'neg' : 'pos'}">${rEv ? money(rEv.utilidad) : '—'}</div><div class="s">${rEv ? `gastos ${money(rEv.gastos)}` : ''}</div></div>
     <div class="kpi"><div class="l">Existencia total</div><div class="v">${int(inv.piezas)} pzs</div><div class="s">Consignación: ${money(inv.valor)}</div></div>
   </div>
   ${esTodas() ? `<div class="card" style="margin-top:14px"><h3>🌐 Por sede</h3><div class="tw"><table class="t"><thead><tr><th>Sede</th><th class="n">Existencia</th><th class="n">Valor consignación</th><th class="n">Venta de hoy</th><th class="n">Utilidad acumulada</th><th>Evento activo</th></tr></thead><tbody>
-    ${sedesCodigos().map(c => { const i = inventarioTotales(c), h = resultados({sede:c, desde:hoy, hasta:hoy}), a = resultados({sede:c}), e = eventoActivo(c);
+    ${sedesDe(vista()).map(c => { const i = inventarioTotales(c), h = resultados({sede:c, desde:hoy, hasta:hoy}), a = resultados({sede:c}), e = eventoActivo(c);
       return `<tr><td>${sedeTag(c)} ${esc(sedeNombre(c))}</td><td class="n">${int(i.piezas)}</td><td class="n">${money(i.valor)}</td><td class="n">${money(h.venta)}</td><td class="n ${a.utilidad < 0 ? 'neg' : 'pos'}">${money(a.utilidad)}</td><td class="small">${e ? esc(e.nombre) : '—'}</td></tr>`; }).join('')}
-    <tr class="tot"><td>Total</td><td class="n">${int(inv.piezas)}</td><td class="n">${money(inv.valor)}</td><td class="n">${money(rHoy.venta)}</td><td class="n">${money(resultados({sede:TODAS}).utilidad)}</td><td></td></tr></tbody></table></div></div>` : ''}
+    <tr class="tot"><td>Total</td><td class="n">${int(inv.piezas)}</td><td class="n">${money(inv.valor)}</td><td class="n">${money(rHoy.venta)}</td><td class="n">${money(resultados({sede:vista()}).utilidad)}</td><td></td></tr></tbody></table></div></div>` : ''}
   <div class="grid g2" style="margin-top:14px">
     <div class="card"><div class="row between"><h3>⚠️ Existencia baja (≤ ${int(S.config.umbral_existencia_baja)})</h3><span class="pill ${bajas.length ? 'warn' : 'ok'}">${bajas.length}</span></div>
       ${bajas.length ? `<div class="lowlist"><table class="t">${bajas.sort((a,b) => stockOf(a.id).total - stockOf(b.id).total).slice(0,60).map(v => `<tr class="click" data-a="kardex" data-v="${v.id}"><td>${esc(varLabel(v.id))}</td><td class="n"><span class="pill ${stockOf(v.id).total <= 0 ? 'bad' : 'warn'}">${int(stockOf(v.id).total)}</span></td></tr>`).join('')}</table></div>` : '<div class="muted">Todo en orden.</div>'}
@@ -1522,7 +1553,7 @@ SCREENS.inventario = () => {
     <div class="row" style="margin-bottom:10px"><input type="search" placeholder="🔍 Buscar producto, clave o color…" value="${esc(UI.iq)}" data-i="iq" style="flex:1;width:auto;min-width:220px">
       <label class="chk"><input type="checkbox" data-c="iSolo" ${UI.iSolo ? 'checked' : ''}> Solo con existencia</label></div>
     ${catChips(UI.icat, 'icat')}
-    <div class="tw" style="margin-top:10px"><table class="t"><thead><tr><th>Clave</th><th>Producto</th><th>Color</th>${esTodas() ? sedesCodigos().map(c => `<th class="n">${sedeTag(c)}</th>`).join('') : '<th class="n">Stand</th><th class="n">Casa</th>'}<th class="n">Existencia${esTodas() ? ' total' : ''}</th><th class="n">Precio venta</th><th class="n">Valor fab.</th></tr></thead><tbody id="itb"></tbody></table></div>
+    <div class="tw" style="margin-top:10px"><table class="t"><thead><tr><th>Clave</th><th>Producto</th><th>Color</th>${esTodas() ? sedesDe(vista()).map(c => `<th class="n">${sedeTag(c)}</th>`).join('') : '<th class="n">Stand</th><th class="n">Casa</th>'}<th class="n">Existencia${esTodas() ? ' total' : ''}</th><th class="n">Precio venta</th><th class="n">Valor fab.</th></tr></thead><tbody id="itb"></tbody></table></div>
   </div>
   ${(S.config.lista_casa || []).length ? `<div class="card"><h3>🏠 Lista "Tenemos en casa" (de la hoja de Alika)</h3><ul>${S.config.lista_casa.map(x => `<li>${esc(x)}</li>`).join('')}</ul><div class="small muted">Es una lista de referencia. Para que cuenten como "en casa" en el inventario, usa <b>Stand ⇄ Casa</b>.</div></div>` : ''}`;
 };
@@ -1531,7 +1562,7 @@ function renderInvTabla(){
   const Q = norm(UI.iq);
   const vs = S.variantes.map(v => ({v, p:IDX.prod.get(v.producto_id), s:stockOf(v.id)})).filter(x => x.p && (UI.icat === 'Todas' || x.p.categoria === UI.icat) && (!UI.iSolo || x.s.total > 0) && (!Q || Q.split(' ').every(w => norm(x.p.nombre + ' ' + x.p.clave + ' ' + x.v.color).includes(w))))
     .sort((a,b) => a.p.categoria.localeCompare(b.p.categoria) || a.p.nombre.localeCompare(b.p.nombre) || a.v.color.localeCompare(b.v.color));
-  const umb = num(S.config.umbral_existencia_baja); const T = esTodas(); const sc = sedesCodigos();
+  const umb = num(S.config.umbral_existencia_baja); const T = esTodas(); const sc = sedesDe(vista());
   $('#itb').innerHTML = vs.map(({v,p,s}) => `<tr class="click" data-a="kardex" data-v="${v.id}"><td class="small">${esc(p.clave)}${p.revisar ? ' <span class="pill warn">revisar</span>' : ''}</td><td>${esc(p.nombre)}</td><td>${esc(v.color)}</td>
     ${T ? sc.map(c => `<td class="n">${int(stockOf(v.id, c).total)}</td>`).join('') : `<td class="n">${int(s.Stand)}</td><td class="n">${s.Casa ? int(s.Casa) : ''}</td>`}<td class="n"><span class="pill ${s.total <= 0 ? 'bad' : s.total <= umb ? 'warn' : 'ok'}">${int(s.total)}</span></td><td class="n">${money(precioVenta(p))}</td><td class="n">${money(s.total * num(p.precio_fabricante))}</td></tr>`).join('') +
     `<tr class="tot"><td colspan="3">${vs.length} variantes</td>${T ? sc.map(c => `<td class="n">${int(sum(vs, x => stockOf(x.v.id, c).total))}</td>`).join('') : '<td></td><td></td>'}<td class="n">${int(sum(vs, x => x.s.total))}</td><td></td><td class="n">${money(sum(vs, x => x.s.total * num(x.p.precio_fabricante)))}</td></tr>`;
@@ -1554,8 +1585,8 @@ function kardexModal(vid){
   const v = IDX.vari.get(vid), p = IDX.prod.get(v.producto_id), s = stockOf(vid);
   const rows = kardexRows(vid);
   modal(`${mhead('Kárdex')}<div class="row between"><div><div class="b" style="font-size:1.15rem">${esc(p.nombre)} · ${esc(v.color)}</div>
-      <div class="muted small">${esc(p.clave)} · ${esc(p.categoria)} · Fab. ${money(p.precio_fabricante)} · Venta ${money(precioVenta(p))} · ${esTodas() ? 'todas las sedes' : 'sede ' + esc(sedeNombre(vista()))}</div></div>
-      <div class="kpi" style="padding:8px 14px"><div class="l">Existencia</div><div class="v">${int(s.total)}</div><div class="s">${esTodas() ? sedesCodigos().map(c => `${c} ${int(stockOf(vid, c).total)}`).join(' · ') : `Stand ${int(s.Stand)} · Casa ${int(s.Casa)}`}</div></div></div>
+      <div class="muted small">${esc(p.clave)} · ${esc(p.categoria)} · Fab. ${money(p.precio_fabricante)} · Venta ${money(precioVenta(p))} · ${esc(sedeNombre(vista()))}</div></div>
+      <div class="kpi" style="padding:8px 14px"><div class="l">Existencia</div><div class="v">${int(s.total)}</div><div class="s">${esTodas() ? sedesDe(vista()).map(c => `${c} ${int(stockOf(vid, c).total)}`).join(' · ') : `Stand ${int(s.Stand)} · Casa ${int(s.Casa)}`}</div></div></div>
     <div class="tw" style="margin:12px 0;max-height:50vh"><table class="t"><thead><tr><th>Fecha</th><th>Tipo</th><th>Detalle</th><th class="n">Mov.</th><th class="n">Saldo</th><th></th></tr></thead><tbody>
     ${rows.map(({m, d, saldo}) => `<tr><td class="small">${fdt(m.fecha_hora)}</td><td>${esTodas() ? sedeTag(m.sede_codigo) + ' ' : ''}${TIPO_MOV_TXT[m.tipo] || m.tipo}</td>
       <td class="small">${esc(detalleMov(m))}</td>
@@ -1818,7 +1849,7 @@ A.masivo = () => {
 
 /* importación */
 A.importar = () => {
-  const IM = {sheets:null, si:0, header:0, map:{}, an:null, nombre:'', sede: esTodas() ? sedes()[0].codigo : vista(), modo:null, nueva:null, costos:{}};
+  const IM = {sheets:null, si:0, header:0, map:{}, an:null, nombre:'', sede: esTodas() ? (sedesDe(vista())[0] || sedes()[0].codigo) : vista(), modo:null, nueva:null, costos:{}};
   const m = modal(`${mhead('📥 Cargar inventario de una sede')}<div id="imb"></div>`, {wide:true});
   /* paso 0: a qué sede y cómo */
   const paso0 = () => {
@@ -1843,7 +1874,7 @@ A.importar = () => {
     $('#im0ok', m).onclick = () => {
       if (IM.nueva){ const c = cleanTxt(val('#nsc', m)).replace(/[^A-Z0-9]/g, ''); const n = val('#nsn', m).trim();
         if (c.length < 2 || !n){ toast('Escribe el código y el nombre de la nueva sede.'); return; }
-        if (c === TODAS || sedes().some(x => x.codigo === c)){ toast('Ese código ya existe.'); return; }
+        if (c === TODAS || c.startsWith('CIU') || sedes().some(x => x.codigo === c)){ toast('Ese código ya existe.'); return; }
         IM.nueva = {codigo:c, nombre:n, color:val('#nsk', m) || '#8a6d1f'}; IM.sede = c; }
       paso1();
     };
@@ -2036,7 +2067,7 @@ function editarEvento(eid, {rapido = false} = {}){
 SCREENS.gastos = () => {
   const ev = eventoActivo(); const f = UI.gf;
   return `${topbar('Gastos')}
-  ${esTodas() ? '<div class="card alert info">Para registrar un gasto, elige una sede arriba. Aquí puedes consultar los gastos de todas las sedes.</div>' : `<div class="card"><h2>➕ Registrar gasto en ${esc(sedeNombre(vista()))}</h2>
+  ${esTodas() ? `<div class="card alert info">Para registrar un gasto, elige una sede arriba. Aquí puedes consultar los gastos de ${esc(sedeNombre(vista()))}.</div>` : `<div class="card"><h2>➕ Registrar gasto en ${esc(sedeNombre(vista()))}</h2>
     <div class="grid g2">
       <label class="f">Monto *<input type="number" inputmode="decimal" id="gm" placeholder="$0.00" style="font-size:1.4rem;font-weight:800"></label>
       <label class="f">Evento<select id="ge">${eventosOpts(ev?.id || '', {ninguno:'Gasto general (sin evento)'})}</select></label>
@@ -2126,14 +2157,14 @@ function estadoResultadosHTML(r, cls = 't'){
 }
 /* estado de resultados con una columna por sede y el total */
 function estadoConsolidado(f){
-  const sc = sedesCodigos();
-  const all = [...sc.map(c => resultados({sede:c, desde:f.desde, hasta:f.hasta})), resultados({sede:TODAS, desde:f.desde, hasta:f.hasta})];
+  const g = f.sede || vista(), sc = columnasDe(g);
+  const all = [...sc.map(c => resultados({sede:c.key, desde:f.desde, hasta:f.hasta})), resultados({sede:g, desde:f.desde, hasta:f.hasta})];
   const cats = [...new Set(all.flatMap(r => Object.keys(r.gastosCat)))];
   const fila = (t, fn, cls) => ({c:[t, ...all.map(fn)], cls});
   const rows = [fila('Venta a precio de lista', r => r.ventaLista), fila('(−) Descuentos', r => r.descuentos), fila('Venta bruta', r => r.venta, 'tot'),
     fila('   de ello consumo propio', r => r.consumo.venta), fila('(−) Pago a fabricante', r => r.fab), fila('Margen bruto', r => r.margen, 'tot'),
     ...cats.map(c => fila('(−) ' + c, r => r.gastosCat[c] || 0)), fila('Total de gastos', r => r.gastos), fila('UTILIDAD NETA', r => r.utilidad, 'tot')];
-  return {cols:[{t:'Concepto'}, ...sc.map(c => ({t:sedeNombre(c), f:'money'})), {t:'Total', f:'money'}], rows, all};
+  return {cols:[{t:'Concepto'}, ...sc.map(c => ({t:g === TODAS ? c.t : sedeNombre(c.key), f:'money'})), {t:'Total', f:'money'}], rows, all, sc};
 }
 function tablaHTML(t){
   return `<div class="tw"><table class="t"><thead><tr>${t.cols.map(k => `<th class="${k.f ? 'n' : ''}">${esc(k.t)}</th>`).join('')}</tr></thead><tbody>
@@ -2160,7 +2191,7 @@ SCREENS.resultados = () => {
   </div>
   <div class="grid g2" style="margin-top:14px">
     <div class="card"><div class="row between"><h2>Estado de resultados</h2><button class="btn sm ghost" data-a="repER">🖨️ Imprimir</button></div>
-      <div class="small muted" style="margin-bottom:8px">${esc(esTodas() && !ev ? 'Consolidado de todas las sedes' : sedeNombre(ev ? ev.sede_codigo : vista()))} · ${ev ? esc(ev.nombre) : 'Todos los eventos y gastos generales'}${f.desde || f.hasta ? ` · ${fdate(f.desde) || 'inicio'} a ${fdate(f.hasta) || 'hoy'}` : ''}</div>
+      <div class="small muted" style="margin-bottom:8px">${esc(sedeNombre(ev ? ev.sede_codigo : vista()))} · ${ev ? esc(ev.nombre) : 'Todos los eventos y gastos generales'}${f.desde || f.hasta ? ` · ${fdate(f.desde) || 'inicio'} a ${fdate(f.hasta) || 'hoy'}` : ''}</div>
       ${esTodas() && !ev ? tablaHTML(estadoConsolidado(f)) : estadoResultadosHTML(r)}
       ${Object.keys(r.porMetodo).length ? `<h3 style="margin-top:14px">Por forma de pago</h3><table class="t">${Object.entries(r.porMetodo).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${money(v)}</td></tr>`).join('')}</table>` : ''}
       ${r.inversion ? `<div class="small muted" style="margin-top:8px">Incluye ${money(r.inversion)} de inversión inicial (exhibidores, etc.).</div>` : ''}
@@ -2295,7 +2326,7 @@ function fmtCell(v, f){ if (v == null || v === '') return ''; if (f === 'money')
 function repHTML(rep){
   const c = S.config;
   return `<div class="rep"><div class="rep-head"><div class="t1">Alika · ${esc(rep.titulo)}</div>
-    <div class="t2">Sede: ${rep.sede === TODAS ? 'Consolidado (todas las sedes)' : esc(sedeNombre(rep.sede || vista())) + ' (' + esc(rep.sede || vista()) + ')'} · Fecha: ${fdt(nowISO())} · Responsable: ${esc(c.responsable || '—')} · Montos en MXN${rep.sub ? '<br>' + rep.sub : ''}</div></div>
+    <div class="t2">Sede: ${rep.sede === TODAS ? 'Consolidado (todas las sedes)' : esGrupo(rep.sede) ? esc(sedeNombre(rep.sede)) : esc(sedeNombre(rep.sede || vista())) + ' (' + esc(rep.sede || vista()) + ')'} · Fecha: ${fdt(nowISO())} · Responsable: ${esc(c.responsable || '—')} · Montos en MXN${rep.sub ? '<br>' + rep.sub : ''}</div></div>
     ${rep.pre || ''}
     ${rep.cols ? `<table><thead><tr>${rep.cols.map(k => `<th class="${['money','int','pct'].includes(k.f) ? 'n' : ''}">${esc(k.t)}</th>`).join('')}</tr></thead><tbody>
     ${rep.rows.map(r => `<tr class="${r.cls || ''}">${r.c.map((v, i) => `<td class="${['money','int','pct'].includes(rep.cols[i].f) ? 'n' : ''}">${fmtCell(v, rep.cols[i].f)}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${rep.cols.length}">Sin datos</td></tr>`}
@@ -2304,12 +2335,12 @@ function repHTML(rep){
 function repCSV(rep){ return toCSV([rep.cols.map(c => c.t), ...rep.rows.map(r => r.c.map(v => v == null ? '' : (typeof v === 'number' ? r2(v) : v)))]); }
 function filtroVentas(f){ return S.movimientos.filter(m => esVentaMov(m) && (!f.partes || m.separacion_id) && enSede(m, f.sede || vista()) && (!f.ev || m.evento_id === f.ev) && (!f.desde || dayOf(m.fecha_hora) >= f.desde) && (!f.hasta || dayOf(m.fecha_hora) <= f.hasta)); }
 /* tabla con una columna por sede y el total para cada métrica. items deben traer su sede (sede_codigo) */
-function tablaPorSede(items, {sedeFn = x => x.sede_codigo, keyFn, keyCells, keyCols, metrics, totalLabel = 'TOTAL'}){
-  const sc = sedesCodigos(); const map = new Map();
-  for (const it of items){ const k = keyFn(it); if (!map.has(k)) map.set(k, {cells:keyCells(it), v:{}}); const row = map.get(k); const sd = sedeFn(it);
+function tablaPorSede(items, {sedeFn = x => x.sede_codigo, keyFn, keyCells, keyCols, metrics, totalLabel = 'TOTAL', grupo = TODAS}){
+  const cols0 = columnasDe(grupo), colDe = new Map(cols0.flatMap(c => c.codes.map(x => [x, c.key]))), sc = cols0.map(c => c.key); const map = new Map();
+  for (const it of items){ const sd = colDe.get(sedeFn(it)); if (!sd) continue; const k = keyFn(it); if (!map.has(k)) map.set(k, {cells:keyCells(it), v:{}}); const row = map.get(k);
     metrics.forEach((mt, i) => { const key = i + '|' + sd; row.v[key] = (row.v[key] || 0) + num(mt.val(it)); }); }
   const vals = r => metrics.flatMap((mt, i) => { const vs = sc.map(c => r.v[i + '|' + c] || 0); return [...vs, sum(vs)]; });
-  const cols = [...keyCols, ...metrics.flatMap(mt => [...sc.map(c => ({t:`${mt.t} ${c}`, f:mt.f})), {t:`${mt.t} total`, f:mt.f}])];
+  const cols = [...keyCols, ...metrics.flatMap(mt => [...cols0.map(c => ({t:`${mt.t} ${c.t}`, f:mt.f})), {t:`${mt.t} total`, f:mt.f}])];
   const rows = [...map.values()].filter(r => Object.values(r.v).some(x => x)).map(r => ({c:[...r.cells, ...vals(r)]}));
   const tot = {v:{}}; for (const r of map.values()) for (const [k, x] of Object.entries(r.v)) tot.v[k] = (tot.v[k] || 0) + x;
   rows.push({c:[totalLabel, ...keyCols.slice(1).map(() => ''), ...vals(tot)], cls:'tot'});
@@ -2346,7 +2377,7 @@ const REP1 = {
     const vids = f.vid ? [f.vid] : f.pid ? (IDX.varsByProd.get(f.pid) || []).map(v => v.id) : [];
     const cols = [{t:'Fecha'},{t:'Color'},{t:'Tipo'},{t:'Detalle'},{t:'Movimiento',f:'int'},{t:'Saldo',f:'int'}];
     const rows = [];
-    for (const vid of vids){ const v = IDX.vari.get(vid); kardexRows(vid, f.sede).forEach(({m, d, saldo}) => rows.push({c:[fdt(m.fecha_hora), v.color, (f.sede === TODAS ? m.sede_codigo + ' · ' : '') + TIPO_MOV_TXT[m.tipo], detalleMov(m), m.tipo === 'TRASPASO' ? 0 : d, saldo]})); rows.push({c:['', v.color, 'EXISTENCIA', '', '', stockOf(vid, f.sede).total], cls:'tot'}); }
+    for (const vid of vids){ const v = IDX.vari.get(vid); kardexRows(vid, f.sede).forEach(({m, d, saldo}) => rows.push({c:[fdt(m.fecha_hora), v.color, (esGrupo(f.sede) ? m.sede_codigo + ' · ' : '') + TIPO_MOV_TXT[m.tipo], detalleMov(m), m.tipo === 'TRASPASO' ? 0 : d, saldo]})); rows.push({c:['', v.color, 'EXISTENCIA', '', '', stockOf(vid, f.sede).total], cls:'tot'}); }
     const p = f.vid ? prodOfVar(f.vid) : IDX.prod.get(f.pid);
     return {titulo:'Kárdex', sub: p ? `${esc(p.clave)} · ${esc(p.nombre)}${f.vid ? ' · ' + esc(IDX.vari.get(f.vid).color) : ' (todos los colores)'}` : 'Elige un producto', cols, rows};
   },
@@ -2362,7 +2393,7 @@ const REP1 = {
     const T = (xs, k) => sum(xs, x => x.r[k]);
     const fila = (t, xs, cls) => ({c:[t,'','',T(xs,'piezas'),T(xs,'venta'),T(xs,'fab'),T(xs,'margen'),T(xs,'gastos'),T(xs,'utilidad')], cls});
     const rows = [];
-    if (f.sede === TODAS){ for (const [sd, xs] of groupBy(ev, x => x.s)){ rows.push(...xs, fila('Subtotal ' + sd, xs, 'tot')); } } else rows.push(...ev);
+    if (esGrupo(f.sede)){ for (const [sd, xs] of groupBy(ev, x => x.s)){ rows.push(...xs, fila('Subtotal ' + sd, xs, 'tot')); } } else rows.push(...ev);
     rows.push(fila('TOTAL', ev, 'tot'));
     return {titulo:'Ventas por evento', sub:subFiltro(f), cols, rows};
   },
@@ -2428,9 +2459,9 @@ const REP1 = {
     return {titulo:'Consumo propio', sub:subFiltro(f) + ' · Se paga a Alika a precio de fabricante; margen $0.', cols, rows};
   },
   cortesLista(f){
-    const cs = S.cortes.filter(c => f.sede === TODAS || c.sede_codigo === f.sede || c.sede_codigo === TODAS).filter(c => (!f.desde || dayOf(c.fecha_corte) >= f.desde) && (!f.hasta || dayOf(c.fecha_corte) <= f.hasta)).sort((a,b) => a.fecha_corte.localeCompare(b.fecha_corte));
+    const cs = S.cortes.filter(c => corteVisible(c, f.sede)).filter(c => (!f.desde || dayOf(c.fecha_corte) >= f.desde) && (!f.hasta || dayOf(c.fecha_corte) <= f.hasta)).sort((a,b) => a.fecha_corte.localeCompare(b.fecha_corte));
     const cols = [{t:'Folio'},{t:'Sede'},{t:'Fecha'},{t:'Periodo'},{t:'Piezas',f:'int'},{t:'A pagar',f:'money'},{t:'Devueltas',f:'int'},{t:'Estado'},{t:'Pago'}];
-    const rows = cs.map(c => ({c:[c.folio || '', c.sede_codigo === TODAS ? 'Conjunto' : c.sede_codigo, fdt(c.fecha_corte), `${fdate(c.periodo_desde) || 'inicio'} a ${fdate(c.periodo_hasta) || '—'}`, c.piezas, c.total_a_pagar_fabricante, c.piezas_devueltas, c.estado, c.fecha_pago ? fdate(c.fecha_pago) + (c.referencia ? ' · ' + c.referencia : '') : '']}));
+    const rows = cs.map(c => ({c:[c.folio || '', alcanceTxt(c.sede_codigo), fdt(c.fecha_corte), `${fdate(c.periodo_desde) || 'inicio'} a ${fdate(c.periodo_hasta) || '—'}`, c.piezas, c.total_a_pagar_fabricante, c.piezas_devueltas, c.estado, c.fecha_pago ? fdate(c.fecha_pago) + (c.referencia ? ' · ' + c.referencia : '') : '']}));
     rows.push({c:['TOTAL','','','',sum(cs, c => c.piezas),sum(cs, c => c.total_a_pagar_fabricante),sum(cs, c => c.piezas_devueltas),`Pendiente: ${money(sum(cs.filter(c => c.estado !== 'Pagado'), c => c.total_a_pagar_fabricante))}`,''], cls:'tot'});
     return {titulo:'Cortes con Alika', sub:subFiltro(f), cols, rows};
   },
@@ -2438,14 +2469,14 @@ const REP1 = {
   corte(f){
     const c = S.cortes.find(x => x.id === f.corte_id);
     if (!c) return {titulo:'Comprobante de corte', sub:'No se encontró el corte.', cols:[{t:'—'}], rows:[]};
-    const T = c.sede_codigo === TODAS; const ids = new Set(c.movimiento_ids || []), dids = new Set(c.devolucion_ids || []);
+    const T = esGrupo(c.sede_codigo); const ids = new Set(c.movimiento_ids || []), dids = new Set(c.devolucion_ids || []);
     const ventas = S.movimientos.filter(m => ids.has(m.id)), devs = S.movimientos.filter(m => dids.has(m.id));
     const cols = [{t:'Clave'},{t:'Producto'},{t:'Color'}, ...(T ? [{t:'Sede'}] : []), {t:'Piezas',f:'int'},{t:'Precio fab.',f:'money'},{t:'A pagar',f:'money'}];
     const rows = [...groupBy(ventas, m => m.variante_id + '|' + m.precio_fabricante_unit + (T ? '|' + m.sede_codigo : ''))].map(([k, ms]) => { const v = IDX.vari.get(ms[0].variante_id), p = IDX.prod.get(ms[0].producto_id);
       return {c:[p?.clave, p?.nombre, v?.color, ...(T ? [ms[0].sede_codigo] : []), sum(ms, vendidas), ms[0].precio_fabricante_unit, sum(ms, fabLinea)]}; }).filter(x => x.c[T ? 4 : 3]).sort((a,b) => String(a.c[1]).localeCompare(String(b.c[1])));
     rows.push({c:['TOTAL A PAGAR A ALIKA','','', ...(T ? [''] : []), sum(ventas, vendidas),'',sum(ventas, fabLinea)], cls:'tot'});
-    const porSede = T ? sedesCodigos().map(sd => `${esc(sedeNombre(sd))}: ${money(sum(ventas.filter(m => m.sede_codigo === sd), fabLinea))}`).join(' · ') : '';
-    const pre = `<table style="margin-bottom:10px"><tr><th>Folio</th><td>${esc(c.folio || '')} <span style="font-size:8pt;color:#666">(${esc(c.id.slice(0,8))})</span></td><th>Sede</th><td>${T ? 'Conjunto (todas las sedes)' : esc(sedeNombre(c.sede_codigo))}</td></tr>
+    const porSede = T ? sedesDe(c.sede_codigo).map(sd => `${esc(sedeNombre(sd))}: ${money(sum(ventas.filter(m => m.sede_codigo === sd), fabLinea))}`).join(' · ') : '';
+    const pre = `<table style="margin-bottom:10px"><tr><th>Folio</th><td>${esc(c.folio || '')} <span style="font-size:8pt;color:#666">(${esc(c.id.slice(0,8))})</span></td><th>Sede</th><td>${c.sede_codigo === TODAS ? 'Conjunto (todas las sedes)' : esc(sedeNombre(c.sede_codigo))}</td></tr>
       <tr><th>Fecha del corte</th><td>${fdt(c.fecha_corte)}</td><th>Periodo</th><td>${fdate(c.periodo_desde) || 'desde el inicio'} al ${fdate(c.periodo_hasta) || '—'}</td></tr>
       <tr><th>Estado</th><td><b>${esc(c.estado)}</b></td><th>Pago</th><td>${c.fecha_pago ? fdate(c.fecha_pago) + (c.referencia ? ' · Ref. ' + esc(c.referencia) : '') : '—'}</td></tr></table>`;
     const devHTML = devs.length ? `<h3 style="margin-top:12px">Devoluciones a Alika incluidas</h3><table><thead><tr><th>Fecha</th>${T ? '<th>Sede</th>' : ''}<th>Producto</th><th>Color</th><th class="n">Piezas</th><th class="n">Valor fab.</th></tr></thead><tbody>
@@ -2460,28 +2491,27 @@ const REP1 = {
 const REP_CONS = {
   inventario(f){
     const items = [];
-    const vs = S.variantes.map(v => ({v, p:IDX.prod.get(v.producto_id)})).filter(x => x.p && (!f.cat || x.p.categoria === f.cat) && (!f.solo || stockOf(x.v.id, TODAS).total > 0))
+    const vs = S.variantes.map(v => ({v, p:IDX.prod.get(v.producto_id)})).filter(x => x.p && (!f.cat || x.p.categoria === f.cat) && (!f.solo || stockOf(x.v.id, f.sede).total > 0))
       .sort((a,b) => a.p.categoria.localeCompare(b.p.categoria) || a.p.nombre.localeCompare(b.p.nombre) || a.v.color.localeCompare(b.v.color));
-    for (const x of vs) for (const sd of sedesCodigos()) items.push({...x, sede_codigo:sd, q:stockOf(x.v.id, sd).total});
+    for (const x of vs) for (const sd of sedesDe(f.sede)) items.push({...x, sede_codigo:sd, q:stockOf(x.v.id, sd).total});
     const t = tablaPorSede(items, {keyFn:x => x.v.id, keyCells:x => [x.p.clave, x.p.nombre, x.v.color], keyCols:[{t:'Clave'},{t:'Producto'},{t:'Color'}],
-      metrics:[{t:'Pzs', f:'int', val:x => x.q}, {t:'Valor', f:'money', val:x => x.q * num(x.p.precio_fabricante)}], totalLabel:'TOTAL GENERAL'});
-    if (!f.solo){ /* incluir también variantes sin existencia */ }
-    return {titulo:'Inventario actual (consolidado)', sub:subFiltro(f) + ' · Valor = a precio de fabricante (consignación).', ...t};
+      metrics:[{t:'Pzs', f:'int', val:x => x.q}, {t:'Valor', f:'money', val:x => x.q * num(x.p.precio_fabricante)}], totalLabel:'TOTAL GENERAL', grupo:f.sede});
+    return {titulo:`Inventario actual (${esc(sedeNombre(f.sede))})`, sub:subFiltro(f) + ' · Valor = a precio de fabricante (consignación).', ...t};
   },
   conteo(f){
     const items = [];
     const vs = S.variantes.map(v => ({v, p:IDX.prod.get(v.producto_id)})).filter(x => x.p && x.p.activo !== false && (!f.cat || x.p.categoria === f.cat))
       .sort((a,b) => a.p.categoria.localeCompare(b.p.categoria) || a.p.nombre.localeCompare(b.p.nombre) || a.v.color.localeCompare(b.v.color));
-    const sc = sedesCodigos();
+    const sc = sedesDe(f.sede);
     const cols = [{t:'Clave'},{t:'Producto'},{t:'Color'}, ...sc.map(c => ({t:'Sistema ' + c, f:'int'})), {t:'Físico'}, {t:'Diferencia'}];
     const rows = vs.map(({v,p}) => ({c:[p.clave, p.nombre, v.color, ...sc.map(c => stockOf(v.id, c).total), '', '']}));
     rows.push({c:['TOTAL','','', ...sc.map(c => sum(vs, x => stockOf(x.v.id, c).total)), '', ''], cls:'tot'});
-    return {titulo:'Hoja de conteo físico (todas las sedes)', sub:subFiltro(f), cols, rows, extra:`<div class="firmas"><div>Contó</div><div>Revisó</div></div>`};
+    return {titulo:`Hoja de conteo físico (${esc(sedeNombre(f.sede))})`, sub:subFiltro(f), cols, rows, extra:`<div class="firmas"><div>Contó</div><div>Revisó</div></div>`};
   },
   ventasDia(f){
     const movs = filtroVentas(f).sort((a,b) => a.fecha_hora.localeCompare(b.fecha_hora));
     const t = tablaPorSede(movs, {keyFn:m => dayOf(m.fecha_hora), keyCells:m => [fdate(dayOf(m.fecha_hora))], keyCols:[{t:'Día'}],
-      metrics:[{t:'Pzs', f:'int', val:vendidas}, {t:'Venta', f:'money', val:ventaLinea}, {t:'Margen', f:'money', val:m => ventaLinea(m) - fabLinea(m)}]});
+      metrics:[{t:'Pzs', f:'int', val:vendidas}, {t:'Venta', f:'money', val:ventaLinea}, {t:'Margen', f:'money', val:m => ventaLinea(m) - fabLinea(m)}], grupo:f.sede});
     return {titulo:'Ventas por día (consolidado)', sub:subFiltro(f), ...t};
   },
   ventasProducto(f){
@@ -2489,30 +2519,30 @@ const REP_CONS = {
     const orden = new Map(topProductos(movs).map((x, i) => [x.p?.id, i]));
     movs.sort((a,b) => (orden.get(a.producto_id) ?? 0) - (orden.get(b.producto_id) ?? 0));
     const t = tablaPorSede(movs, {keyFn:m => m.producto_id, keyCells:m => { const p = IDX.prod.get(m.producto_id); return [p?.clave, p?.nombre]; }, keyCols:[{t:'Clave'},{t:'Producto'}],
-      metrics:[{t:'Pzs', f:'int', val:vendidas}, {t:'Venta', f:'money', val:ventaLinea}, {t:'A Fabiola', f:'money', val:fabLinea}]});
+      metrics:[{t:'Pzs', f:'int', val:vendidas}, {t:'Venta', f:'money', val:ventaLinea}, {t:'A Fabiola', f:'money', val:fabLinea}], grupo:f.sede});
     return {titulo:'Ventas por producto (consolidado)', sub:subFiltro(f), ...t};
   },
   gastosCategoria(f){
-    const gs = S.gastos.filter(g => (!f.ev || g.evento_id === f.ev) && (!f.desde || g.fecha >= f.desde) && (!f.hasta || g.fecha <= f.hasta));
-    const t = tablaPorSede(gs, {keyFn:g => g.categoria, keyCells:g => [g.categoria], keyCols:[{t:'Categoría'}], metrics:[{t:'Monto', f:'money', val:g => g.monto}]});
+    const gs = S.gastos.filter(g => enSede(g, f.sede) && (!f.ev || g.evento_id === f.ev) && (!f.desde || g.fecha >= f.desde) && (!f.hasta || g.fecha <= f.hasta));
+    const t = tablaPorSede(gs, {keyFn:g => g.categoria, keyCells:g => [g.categoria], keyCols:[{t:'Categoría'}], metrics:[{t:'Monto', f:'money', val:g => g.monto}], grupo:f.sede});
     return {titulo:'Gastos por categoría (consolidado)', sub:subFiltro(f) + ' · Las comisiones de tarjeta se ven en el estado de resultados.', ...t};
   },
   resultados(f){
     if (f.ev) return REP1.resultados(f);
     const t = estadoConsolidado(f);
-    return {titulo:'Estado de resultados (consolidado)', sub:'Todas las sedes' + (f.desde || f.hasta ? ` · ${fdate(f.desde) || 'inicio'} a ${fdate(f.hasta) || 'hoy'}` : ''), cols:t.cols, rows:t.rows,
-      extra:`<p style="font-size:9pt">Piezas vendidas: ${t.all.map((r, i) => (i < t.all.length - 1 ? sedesCodigos()[i] : 'Total') + ' ' + int(r.piezas)).join(' · ')}</p>`};
+    return {titulo:'Estado de resultados (consolidado)', sub:esc(sedeNombre(f.sede)) + (f.desde || f.hasta ? ` · ${fdate(f.desde) || 'inicio'} a ${fdate(f.hasta) || 'hoy'}` : ''), cols:t.cols, rows:t.rows,
+      extra:`<p style="font-size:9pt">Piezas vendidas: ${t.all.map((r, i) => (i < t.sc.length ? t.sc[i].t : 'Total') + ' ' + int(r.piezas)).join(' · ')}</p>`};
   },
   pendienteAlika(f){
     const movs = filtroVentas(f).filter(m => !m.corte_id).sort((a,b) => String(IDX.prod.get(a.producto_id)?.nombre).localeCompare(String(IDX.prod.get(b.producto_id)?.nombre)));
     const t = tablaPorSede(movs, {keyFn:m => m.variante_id + '|' + m.precio_fabricante_unit, keyCells:m => [IDX.prod.get(m.producto_id)?.nombre, IDX.vari.get(m.variante_id)?.color, m.precio_fabricante_unit], keyCols:[{t:'Producto'},{t:'Color'},{t:'Precio fab.', f:'money'}],
-      metrics:[{t:'Pzs', f:'int', val:vendidas}, {t:'A pagar', f:'money', val:fabLinea}], totalLabel:'TOTAL A PAGAR A ALIKA'});
+      metrics:[{t:'Pzs', f:'int', val:vendidas}, {t:'A pagar', f:'money', val:fabLinea}], totalLabel:'TOTAL A PAGAR A ALIKA', grupo:f.sede});
     return {titulo:'Ventas pendientes de pagar a Alika (consolidado)', sub:subFiltro(f) + ' · Ventas que todavía no están en un corte.', ...t,
       extra:`<div class="firmas"><div>Alika (Fabiola)</div><div>${esc(S.config.responsable || 'Responsable')}</div></div>`};
   },
 };
 const REP = {};
-for (const k of Object.keys(REP1)) REP[k] = f => { f = {...f, sede: f.sede || vista()}; const r = (f.sede === TODAS && REP_CONS[k]) ? REP_CONS[k](f) : REP1[k](f); if (!r.sede) r.sede = f.sede; return r; };
+for (const k of Object.keys(REP1)) REP[k] = f => { f = {...f, sede: f.sede || vista()}; const r = (esGrupo(f.sede) && REP_CONS[k]) ? REP_CONS[k](f) : REP1[k](f); if (!r.sede) r.sede = f.sede; return r; };
 const REP_FILTROS = {inventario:['cat','solo'], conteo:['cat'], kardex:['prod'], ventasDia:['ev','fechas'], ventasEvento:['fechas'], ventasProducto:['ev','fechas','cat','partes'], ventasDetalle:['ev','fechas'],
   gastosEvento:['ev','fechas'], gastosCategoria:['ev','fechas'], resultados:['ev','fechas'], pendienteAlika:['ev','fechas'], consumo:['ev','fechas'], cortesLista:['fechas'], corte:[]};
 function abrirReporte(k, f0 = {}){
@@ -2520,7 +2550,7 @@ function abrirReporte(k, f0 = {}){
   const fl = REP_FILTROS[k] || [];
   const m = modal(`${mhead(REPORTES.find(r => r[0] === k)?.[2] || 'Reporte')}
     <div class="grid g4" style="margin-bottom:10px">
-      ${k !== 'corte' ? `<label class="f">Sede<select id="rfsede">${sedes().map(x => opt(x.codigo, x.nombre, f.sede)).join('')}${opt(TODAS, 'Consolidado (todas)', f.sede)}</select></label>` : ''}
+      ${k !== 'corte' ? `<label class="f">Sede<select id="rfsede">${opcionesVista(f.sede)}</select></label>` : ''}
       ${fl.includes('ev') ? `<label class="f">Evento<select id="rfe">${eventosOpts(f.ev, {todos:'Todos', sede:TODAS})}</select></label>` : ''}
       ${fl.includes('fechas') ? `<label class="f">Desde<input type="date" id="rfd" value="${f.desde}"></label><label class="f">Hasta<input type="date" id="rfh" value="${f.hasta}"></label>` : ''}
       ${fl.includes('cat') ? `<label class="f">Categoría<select id="rfc">${opt('', 'Todas', f.cat)}${catsEnUso().map(c => opt(c, c, f.cat)).join('')}</select></label>` : ''}
@@ -2545,12 +2575,12 @@ function abrirReporte(k, f0 = {}){
    ========================================================================= */
 SCREENS.cortes = () => {
   const sede = vista(); const pend = pendientesCorte(sede, '', '');
-  const cs = S.cortes.filter(c => sede === TODAS || c.sede_codigo === sede || c.sede_codigo === TODAS).sort((a,b) => b.fecha_corte.localeCompare(a.fecha_corte));
+  const cs = S.cortes.filter(c => corteVisible(c, sede)).sort((a,b) => b.fecha_corte.localeCompare(a.fecha_corte));
   const porPagar = cs.filter(c => c.estado !== 'Pagado');
   return `${topbar('Cortes con Alika')}
   <div class="alert info">El corte junta las ventas que todavía no se le han pagado a Alika (más las devoluciones) y calcula cuánto se le paga a Fabiola: siempre el <b>precio de fabricante</b>. Las ventas que entran a un corte quedan <b>bloqueadas</b>: ya no se pueden borrar.</div>
   <div class="grid g4">
-    <div class="kpi"><div class="l">Ventas sin corte</div><div class="v">${int(sum(pend.ventas, vendidas))} pzs</div><div class="s">${esc(sede === TODAS ? 'todas las sedes' : sedeNombre(sede))}</div></div>
+    <div class="kpi"><div class="l">Ventas sin corte</div><div class="v">${int(sum(pend.ventas, vendidas))} pzs</div><div class="s">${esc(sedeNombre(sede))}</div></div>
     <div class="kpi"><div class="l">Por liquidar (sin corte)</div><div class="v">${money(sum(pend.ventas, fabLinea))}</div><div class="s">a precio de fabricante</div></div>
     <div class="kpi"><div class="l">Devoluciones sin corte</div><div class="v">${int(sum(pend.devoluciones, m => m.cantidad))} pzs</div></div>
     <div class="kpi"><div class="l">Cortes por pagar</div><div class="v">${money(sum(porPagar, c => c.total_a_pagar_fabricante))}</div><div class="s">${porPagar.length} corte(s) pendiente(s)</div></div>
@@ -2563,20 +2593,21 @@ SCREENS.cortes = () => {
     </tbody></table></div>` : '<div class="empty">Todavía no hay cortes.</div>'}</div>`;
 };
 A.nuevoCorte = () => {
-  const alcOpts = esTodas() ? [TODAS] : [vista(), TODAS];
+  const v = vista(), ci = 'CIU:' + ciudadDe(v);
+  const alcOpts = v === TODAS ? [TODAS] : esGrupo(v) ? [v, TODAS] : [v, ...(sedesDe(ci).length > 1 ? [ci] : []), TODAS];
   const st = {alcance:alcOpts[0], desde:'', hasta:localDate(), nota:''};
   const m = modal(`${mhead('🤝 Generar corte con Alika')}<div id="ncb"></div>`, {wide:true});
   const draw = () => {
     const p = pendientesCorte(st.alcance, st.desde, st.hasta);
-    const sc = sedesCodigos();
+    const sc = sedesDe(st.alcance);
     $('#ncb', m).innerHTML = `<div class="grid g3">
       <label class="f">Sede<select id="nca">${alcOpts.map(a => opt(a, a === TODAS ? 'En conjunto (todas las sedes)' : sedeNombre(a), st.alcance)).join('')}</select></label>
       <label class="f">Desde (vacío = todo lo pendiente)<input type="date" id="ncd" value="${st.desde}"></label>
       <label class="f">Hasta<input type="date" id="nch" value="${st.hasta}"></label></div>
       <label class="f" style="margin-top:8px">Nota (opcional)<input type="text" id="ncn" value="${esc(st.nota)}"></label>
-      <div class="tw" style="margin-top:12px"><table class="t"><thead><tr><th></th>${st.alcance === TODAS ? sc.map(c => `<th class="n">${sedeTag(c)}</th>`).join('') + '<th class="n">Total</th>' : '<th class="n">Total</th>'}</tr></thead><tbody>
+      <div class="tw" style="margin-top:12px"><table class="t"><thead><tr><th></th>${esGrupo(st.alcance) ? sc.map(c => `<th class="n">${sedeTag(c)}</th>`).join('') + '<th class="n">Total</th>' : '<th class="n">Total</th>'}</tr></thead><tbody>
         ${[['Piezas vendidas', p.ventas, vendidas, int], ['Venta al público', p.ventas, ventaLinea, money], ['A pagar a Alika (fabricante)', p.ventas, fabLinea, money], ['Piezas devueltas', p.devoluciones, x => x.cantidad, int]].map(([t, arr, fn, fm]) =>
-          `<tr><td>${t}</td>${st.alcance === TODAS ? sc.map(c => `<td class="n">${fm(sum(arr.filter(x => x.sede_codigo === c), fn))}</td>`).join('') : ''}<td class="n b">${fm(sum(arr, fn))}</td></tr>`).join('')}
+          `<tr><td>${t}</td>${esGrupo(st.alcance) ? sc.map(c => `<td class="n">${fm(sum(arr.filter(x => x.sede_codigo === c), fn))}</td>`).join('') : ''}<td class="n b">${fm(sum(arr, fn))}</td></tr>`).join('')}
       </tbody></table></div>
       ${!p.ventas.length && !p.devoluciones.length ? '<div class="alert warn">No hay ventas ni devoluciones pendientes en ese periodo.</div>' : ''}
       <div class="row" style="justify-content:flex-end;margin-top:12px"><button class="btn pri big" id="ncok" ${p.ventas.length || p.devoluciones.length ? '' : 'disabled'}>Generar corte</button></div>`;
@@ -2675,10 +2706,14 @@ C.cargarResp = async el => {
 SCREENS.config = () => {
   const c = S.config;
   return `${topbar('Configuración')}
-  <div class="card"><h2>📍 Sedes</h2><div class="small muted" style="margin-bottom:8px">Cada sede tiene su color en la barra superior para no registrar en la ciudad equivocada. El código no se puede cambiar.</div>
-    <div class="grid g2">${sedes().map(x => `<div class="row"><span class="sedetag" style="--c:${esc(x.color)};font-size:1rem;padding:6px 10px">${esc(x.codigo)}</span>
-      <label class="f" style="flex:1">Nombre<input type="text" data-sn="${esc(x.codigo)}" value="${esc(x.nombre)}"></label>
-      <label class="f">Color<input type="color" data-sc="${esc(x.codigo)}" value="${esc(x.color)}" style="width:64px;height:52px;border:0;background:none"></label></div>`).join('')}</div></div>
+  <div class="card"><h2>📍 Sedes</h2><div class="small muted" style="margin-bottom:8px">Cada sede (sucursal) tiene nombre, ciudad y color. Las sedes de una misma ciudad forman una plaza con su consolidado. El código no se puede cambiar. Solo se puede borrar una sede sin movimientos, eventos, gastos ni cortes.</div>
+    <div class="tw"><table class="t"><thead><tr><th>Código</th><th>Nombre</th><th>Ciudad</th><th>Color</th><th></th></tr></thead><tbody>${sedes().map(x => `<tr><td><span class="sedetag" style="--c:${esc(x.color)};font-size:1rem;padding:6px 10px">${esc(x.codigo)}</span></td>
+      <td><input type="text" data-sn="${esc(x.codigo)}" value="${esc(x.nombre)}"></td><td><input type="text" data-sci="${esc(x.codigo)}" value="${esc(x.ciudad || '')}"></td>
+      <td><input type="color" data-sc="${esc(x.codigo)}" value="${esc(x.color)}" style="width:64px;height:48px;border:0;background:none"></td>
+      <td>${sedeTieneDatos(x.codigo) ? '<span class="small muted">con datos</span>' : `<button class="btn sm ghost" data-a="borrarSede" data-v="${esc(x.codigo)}">🗑️</button>`}</td></tr>`).join('')}
+      <tr><td><input type="text" id="ns_cod" placeholder="MID3" maxlength="6" style="width:90px"></td><td><input type="text" id="ns_nom" placeholder="Mérida Local 3"></td><td><input type="text" id="ns_ciu" placeholder="Mérida" list="dlciu"></td>
+      <td><input type="color" id="ns_col" value="#3b7a57" style="width:64px;height:48px;border:0;background:none"></td><td><button class="btn sm pri" data-a="agregarSede">➕ Agregar</button></td></tr></tbody></table></div>
+    <datalist id="dlciu">${ciudades().map(ci => `<option value="${esc(ci)}">`).join('')}</datalist></div>
   <div class="card"><div class="grid g2">
     <label class="f">Responsable (quien opera)<input type="text" id="cf_re" value="${esc(c.responsable)}"></label>
     <label class="f">Factor de precio sugerido (sugerido = fabricante × factor)<input type="number" inputmode="decimal" step="0.1" id="cf_fa" value="${c.factor_precio_sugerido}"></label>
@@ -2711,11 +2746,27 @@ function drawPP(){
 A.ppAdd = () => { _pp.push({nombre:'Nueva regla', tipo:'Aretes', patron:'CH', precio:200, piso:180}); drawPP(); };
 A.ppReset = () => { _pp = PRECIOS_PARTES_DEFAULT.map(x => ({...x})); drawPP(); };
 A.guardarCfg = async () => {
-  const ss = sedes().map(x => ({...x, nombre: ($(`[data-sn="${x.codigo}"]`)?.value || '').trim() || x.nombre, color: $(`[data-sc="${x.codigo}"]`)?.value || x.color}));
+  const ss = sedes().map(x => ({...x, nombre: ($(`[data-sn="${x.codigo}"]`)?.value || '').trim() || x.nombre, ciudad: ($(`[data-sci="${x.codigo}"]`)?.value || '').trim() || x.ciudad || x.nombre, color: $(`[data-sc="${x.codigo}"]`)?.value || x.color}));
   if (_pp) await saveConfig({precios_partes:_pp.map(x => ({...x}))});
   await saveConfig({sedes:ss, responsable:val('#cf_re').trim(), factor_precio_sugerido:num(val('#cf_fa')) || 2,
     comision_tarjeta_pct:num(val('#cf_co')), umbral_existencia_baja:num(val('#cf_um')), personas:val('#cf_pe').split(',').map(s => s.trim()).filter(Boolean)});
   aplicarSedeVisual(); toast('✅ Configuración guardada'); render();
+};
+const sedeTieneDatos = c => SEDE_STORES.some(k => S[k].some(r => r.sede_codigo === c || (k === 'cortes' && esGrupo(r.sede_codigo) && sedesDe(r.sede_codigo).includes(c)))) || (S.config.eventos_activos || {})[c];
+A.agregarSede = async () => {
+  const c = cleanTxt(val('#ns_cod')).replace(/[^A-Z0-9]/g, ''), n = val('#ns_nom').trim(), ci = val('#ns_ciu').trim();
+  if (c.length < 2 || !n || !ci){ toast('Escribe código (2 a 6 letras/números), nombre y ciudad.'); return; }
+  if (c === TODAS || c.startsWith('CIU') || sedes().some(x => x.codigo === c)){ toast('Ese código ya existe o no se puede usar.'); return; }
+  await saveConfig({sedes:[...sedes().map(x => ({...x})), {codigo:c, nombre:n, ciudad:ci, color:val('#ns_col') || '#3b7a57'}]});
+  toast(`✅ Sede ${esc(n)} agregada`); render();
+};
+A.borrarSede = async el => {
+  const c = el.dataset.v;
+  if (sedeTieneDatos(c)){ alertDlg('No se puede borrar', 'Esta sede ya tiene movimientos, eventos, gastos o cortes.'); return; }
+  if (sedes().length <= 1){ toast('Debe quedar al menos una sede.'); return; }
+  if (!await confirmDlg({titulo:'¿Borrar sede?', msg:`${esc(sedeNombre(c))} (${esc(c)}) no tiene datos.`, ok:'Sí, borrar', danger:true})) return;
+  const patch = {sedes:sedes().filter(x => x.codigo !== c)}; if (vista() === c || (esGrupo(vista()) && !sedesDe(vista()).length)) patch.sede_activa = patch.sedes[0].codigo;
+  await saveConfig(patch); aplicarSedeVisual(); toast('Sede borrada'); render();
 };
 A.borrarTodo = async () => {
   if (!await confirmDlg({titulo:'¿Borrar TODOS los datos?', msg:'Esto no se puede deshacer. ¿Ya guardaste un respaldo?', ok:'Sí, ya respaldé', cancel:'No, cancelar', danger:true})) return;
@@ -2758,7 +2809,7 @@ async function init(){
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') revisarVersion(); });
   }
   let mig = null;
-  try { mig = await migrarLocal(); await migrarLocalV3(); await aplicarRecetasPrecargadas(); }
+  try { mig = await migrarLocal(); await migrarLocalV3(); await normalizarSedes(); await aplicarRecetasPrecargadas(); }
   catch (e){ $('#main').innerHTML = `<div class="card alert bad"><h2>No se pudo actualizar los datos</h2><p>${esc(e.message || e)}</p><p>Tus datos no se modificaron. Guarda un respaldo con la versión anterior y avísanos.</p></div>`; return; }
   aplicarSedeVisual();
   render();
@@ -2768,7 +2819,7 @@ async function init(){
 }
 /* expone funciones para pruebas */
 window.ALIKA = {S, IDX, readXlsx, parseCSV, analizarImport, aplicarImport, leerPrecios, leerCasa, guessHeaderRow, guessMapping, resultados, inventarioTotales, stockOf, calcular, snapshot, cargarRespaldo, validarRespaldo, put, del, clearAll, kardexRows, REP, REP1,
-  migrarSnapshot, migrarLocal, migrarLocalV3, aplicarRecetasPrecargadas, recetaEfectiva, avisoReceta, precioParte, construirSeparacion, deshacerMovs, contenidoEvento, borrarEvento, planImport, totalesPlan, cmpVer, actualizarApp, generarCorte, pagarCorte, cancelarCorte, pendientesCorte, saveConfig, sedesCodigos, vista, loadAll, respaldoPremigracion};
+  migrarSnapshot, migrarLocal, migrarLocalV3, aplicarRecetasPrecargadas, recetaEfectiva, avisoReceta, precioParte, construirSeparacion, deshacerMovs, normalizarSedes, sedesDe, columnasDe, contenidoEvento, borrarEvento, planImport, totalesPlan, cmpVer, actualizarApp, generarCorte, pagarCorte, cancelarCorte, pendientesCorte, saveConfig, sedesCodigos, vista, loadAll, respaldoPremigracion};
 init();
 </script>
 </body>

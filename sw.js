@@ -1,7 +1,7 @@
 /* Service worker de Alika: guarda la app en el equipo para que abra sin internet.
    Los DATOS no pasan por aquí: viven en IndexedDB del navegador.
    Al publicar una versión nueva de index.html, sube el número de CACHE. */
-const CACHE = 'alika-v1.2.1';
+const CACHE = 'alika-v1.2.2';
 const ARCHIVOS = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './icon-maskable-512.png'];
 
 self.addEventListener('install', e => {
