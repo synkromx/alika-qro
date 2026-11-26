@@ -17,10 +17,15 @@ self.addEventListener('activate', e => {
    y caché si no hay conexión. Para lo demás: caché primero. */
 self.addEventListener('fetch', e => {
   const req = e.request;
-  if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
+  // no-store = la revisión de versión nueva: va directo a la red y no se guarda (antes dejaba una copia por cada revisión)
+  if (req.method !== 'GET' || req.cache === 'no-store' || new URL(req.url).origin !== location.origin) return;
   if (req.mode === 'navigate') {
     e.respondWith(
-      fetch(req).then(r => { const copia = r.clone(); caches.open(CACHE).then(c => c.put('./index.html', copia)); return r; })
+      fetch(req).then(r => {
+        // solo guarda la página de la app si llegó bien; una página de error o de otra ruta no debe reemplazar la copia sin internet
+        if (r.ok && !r.redirected && /\/(index\.html)?$/.test(new URL(req.url).pathname)){ const copia = r.clone(); caches.open(CACHE).then(c => c.put('./index.html', copia)); }
+        return r;
+      })
         .catch(() => caches.match('./index.html'))
     );
     return;
